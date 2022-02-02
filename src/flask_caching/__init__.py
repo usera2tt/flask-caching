@@ -11,11 +11,14 @@ import base64
 import functools
 import hashlib
 import inspect
+import json
 import logging
+import random
 import string
+import time
 import uuid
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from typing import Any
 from typing import Callable
 from typing import List
@@ -323,6 +326,8 @@ class Cache:
         cache_none: bool = False,
         make_cache_key: Optional[Callable] = None,
         source_check: Optional[bool] = None,
+        renewal_prob: Optional[int] = None,
+        renewal_start: Optional[int] = None,
     ) -> Callable:
         """Decorator. Use this to cache a function. By default the cache key
         is `view/request.path`. You are able to use this decorator with any
@@ -423,6 +428,12 @@ class Cache:
                              formed with the function's source code hash in
                              addition to other parameters that may be included
                              in the formation of the key.
+
+        :param renewal_prob: Default None. In what {percent} chance of renewal
+                             could occur. 0.01 means 1%.
+        :param renewal_start: Default None. Used to calculate renewal_time_left_thres.
+                              0.1 means the renewal could occur when timeout is left
+                              less than 0.1 * timeout seconds.
         """
 
         def decorator(f):
@@ -436,13 +447,24 @@ class Cache:
                 if source_check is None:
                     source_check = self.source_check
 
+                cache_key = None
                 try:
                     if make_cache_key is not None and callable(make_cache_key):
                         cache_key = make_cache_key(*args, **kwargs)
                     else:
                         cache_key = _make_cache_key(args, kwargs, use_request=True)
 
+                    # Force the cached data to be updated with a certain
+                    # probability before it expires, when ...
+                    # - the time left until the expiration is less than 'renewal_time_left_thres'
+                    # - renewal is not in progress by the same data_key
+                    # - with a 'renewal_prob' chance of happening,
                     if (
+                        renewal_prob is not None
+                        and float(self.cache.get(f'{cache_key}:exp_at') or 0) - time.time() < renewal_time_left_thres
+                        and not (self.cache.get(f'{cache_key}:renewal') or 0)
+                        and random.random() < renewal_prob
+                    ) or (
                         callable(forced_update)
                         and (
                             forced_update(*args, **kwargs)
@@ -451,6 +473,7 @@ class Cache:
                         )
                         is True
                     ):
+                        self.cache.set(f'{cache_key}:renewal', 1, timeout=decorated_function.cache_timeout)
                         rv = None
                         found = False
                     else:
@@ -472,6 +495,8 @@ class Cache:
                             else:
                                 found = self.cache.has(cache_key)
                 except Exception:
+                    if cache_key:
+                        self.cache.set(f'{cache_key}:renewal', 0, timeout=decorated_function.cache_timeout)
                     if self.app.debug:
                         raise
                     logger.exception("Exception possibly due to cache backend.")
@@ -487,10 +512,19 @@ class Cache:
                                 rv,
                                 timeout=decorated_function.cache_timeout,
                             )
+                            self.cache.set(
+                                f'{cache_key}:exp_at',
+                                str(time.time() + timeout),
+                                timeout=decorated_function.cache_timeout,
+                            )
+
                         except Exception:
                             if self.app.debug:
                                 raise
                             logger.exception("Exception possibly due to cache backend.")
+
+                    self.cache.set(f'{cache_key}:renewal', 1, timeout=decorated_function.cache_timeout)
+
                 return rv
 
             def default_make_cache_key(*args, **kwargs):
@@ -573,6 +607,13 @@ class Cache:
             decorated_function.make_cache_key = default_make_cache_key
 
             return decorated_function
+
+        # Replace None or negative timeout to default_timeout
+        if not timeout or timeout < 0:
+            timeout = self.cache.default_timeout
+
+        # Initialize renewal starting point
+        renewal_time_left_thres = timeout * renewal_start if renewal_start else 0
 
         return decorator
 
