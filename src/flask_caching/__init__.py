@@ -696,7 +696,7 @@ class Cache:
         self,
         make_name: Optional[Callable] = None,
         timeout: Optional[Callable] = None,
-        forced_update: bool = False,
+        forced_update: Optional[Union[bool, Callable]] = False,
         hash_method: Callable = hashlib.md5,
         source_check: Optional[bool] = False,
         args_to_ignore: Optional[Any] = None,
@@ -704,13 +704,19 @@ class Cache:
         """Function used to create the cache_key for memoized functions."""
 
         def make_cache_key(f, *args, **kwargs):
+            """
+            if kwargs.force_update is True, renew cached result
+            else, use forced_update callable
+            """
+
+            _force_update = kwargs.pop("force_update", False)
             _timeout = getattr(timeout, "cache_timeout", timeout)
             fname, version_data = self._memoize_version(
                 f,
                 args=args,
                 kwargs=kwargs,
                 timeout=_timeout,
-                forced_update=forced_update,
+                forced_update=forced_update if not _force_update else (lambda: True),
                 args_to_ignore=args_to_ignore,
             )
 
@@ -835,6 +841,13 @@ class Cache:
 
         return bypass_cache
 
+    @staticmethod
+    def _get_data_key(args, kwargs):
+        """Return unique identifier for args and kwargs"""
+        _data_key = hashlib.md5()
+        _data_key.update((str(args) + json.dumps(kwargs, sort_keys=True)).encode())
+        return _data_key.digest()
+
     def memoize(
         self,
         timeout: Optional[int] = None,
@@ -846,6 +859,8 @@ class Cache:
         cache_none: bool = False,
         source_check: Optional[bool] = None,
         args_to_ignore: Optional[Any] = None,
+        renewal_prob: Optional[int] = None,
+        renewal_start: Optional[int] = None,
     ) -> Callable:
         """Use this to cache the result of a function, taking its arguments
         into account in the cache key.
@@ -929,11 +944,23 @@ class Cache:
                                without affecting the cache value that will be
                                returned.
 
+        :param renewal_prob: Default None. In what {percent} chance of renewal
+                             could occur. 0.01 means 1%.
+        :param renewal_start: Default None. Used to calculate renewal_time_left_thres.
+                              0.1 means the renewal could occur when timeout is left
+                              less than 0.1 * timeout seconds.
+
         .. versionadded:: 0.5
             params ``make_name``, ``unless``
 
         .. versionadded:: 1.10
             params ``args_to_ignore``
+
+        The superclass' memoize method allows timeout to be None, and it converts
+        None to default_timeout when it populates cache with set method. But
+        because we calculate the renewal starting point as timeout * renewal_start,
+        timeout should be a integer. Therefore, if it is None or negative, we replace
+        the value to default_timeout
         """
 
         def memoize(f):
@@ -947,10 +974,26 @@ class Cache:
                 if source_check is None:
                     source_check = self.source_check
 
-                try:
-                    cache_key = decorated_function.make_cache_key(f, *args, **kwargs)
+                # We need 'data_key' to discriminate the expiration time by
+                # memoized key which is computed with args and kwargs
+                data_key = self._get_data_key(args, kwargs)
 
-                    if (
+                try:
+                    # Force the cached data to be updated with a certain
+                    # probability before it expires, when ...
+                    # - the time left until the expiration is less than 'renewal_time_left_thres'
+                    # - renewal is not in progress by the same data_key
+                    # - with a 'renewal_prob' chance of happening,
+                    force_update = (
+                        renewal_prob is not None
+                        and decorated_function.exp_at[data_key] - time.time() < renewal_time_left_thres
+                        and not decorated_function.renewal[data_key]
+                        and random.random() < renewal_prob
+                    )
+
+                    cache_key = decorated_function.make_cache_key(f, force_update=force_update, *args, **kwargs)
+
+                    if force_update or (
                         callable(forced_update)
                         and (
                             forced_update(*args, **kwargs)
@@ -959,6 +1002,7 @@ class Cache:
                         )
                         is True
                     ):
+                        decorated_function.renewal[data_key] = True
                         rv = None
                         found = False
                     else:
@@ -980,6 +1024,7 @@ class Cache:
                             else:
                                 found = self.cache.has(cache_key)
                 except Exception:
+                    decorated_function.renewal[data_key] = False
                     if self.app.debug:
                         raise
                     logger.exception("Exception possibly due to cache backend.")
@@ -995,10 +1040,13 @@ class Cache:
                                 rv,
                                 timeout=decorated_function.cache_timeout,
                             )
+                            decorated_function.exp_at[data_key] = time.time() + timeout
+
                         except Exception:
                             if self.app.debug:
                                 raise
                             logger.exception("Exception possibly due to cache backend.")
+                    decorated_function.renewal[data_key] = False
                 return rv
 
             decorated_function.uncached = f
@@ -1013,7 +1061,17 @@ class Cache:
             )
             decorated_function.delete_memoized = lambda: self.delete_memoized(f)
 
+            decorated_function.exp_at = defaultdict(float)  # time.time() + timeout
+            decorated_function.renewal = defaultdict(lambda: False)  # check whether the renewal is in progress
+
             return decorated_function
+
+        # Replace None or negative timeout to default_timeout
+        if not timeout or timeout < 0:
+            timeout = self.cache.default_timeout
+
+        # Initialize renewal starting point
+        renewal_time_left_thres = timeout * renewal_start if renewal_start else 0
 
         return memoize
 
